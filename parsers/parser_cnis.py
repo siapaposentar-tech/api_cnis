@@ -1,68 +1,86 @@
 # ============================================================
 # PARSER CNIS — PROVISÓRIO
 # ESCOPO: CNIS CIDADÃO | SEGURADO EMPREGADO
-# STATUS: CORREÇÃO PASSO 1 (v2) — vínculos não dependem de "Empregado" no cabeçalho
+# REGRA-CHAVE: cria vínculo APENAS quando Tipo Vínculo = Empregado
+# STATUS: PASSO 1 FINAL — linha tabular como gatilho
 # GOVERNANÇA: SUBORDINADO AO P&R CNIS — EMPREGADO
 # ============================================================
 
 import re
+from typing import List, Dict, Optional
 
 # ------------------------------------------------------------
-# PADRÕES REGEX (tolerantes a acento e variações)
+# REGEX BÁSICOS (tolerantes)
 # ------------------------------------------------------------
 
-PADRAO_DATA_COMPLETA = re.compile(r"\b\d{2}/\d{2}/\d{4}\b")
-PADRAO_MES_ANO = re.compile(r"\b\d{2}/\d{4}\b")
+RE_CPF = re.compile(r"\bCPF\b\s*[:\-]?\s*([\d\.\-]+)", re.IGNORECASE)
+RE_NIT = re.compile(r"\bNIT\b\s*[:\-]?\s*([\d\.\-]+)", re.IGNORECASE)
 
-# remuneração: "MM/AAAA 1.234,56" (em qualquer parte da linha)
-PADRAO_REMUNERACAO = re.compile(r"(\d{2}/\d{4})\s+(-?[\d\.\,]+)")
+# datas
+RE_DATA = re.compile(r"\b\d{2}/\d{2}/\d{4}\b")
+RE_MES_ANO = re.compile(r"\b\d{2}/\d{4}\b")
 
-# campos de identificação (tolerantes)
-PADRAO_NIT = re.compile(r"\bNIT\b\s*[:\-]?\s*([\d\.\-]+)", re.IGNORECASE)
-PADRAO_CPF = re.compile(r"\bCPF\b\s*[:\-]?\s*([\d\.\-]+)", re.IGNORECASE)
+# remuneração: "MM/AAAA 1.234,56" (valor pode ser negativo)
+RE_REMUN = re.compile(r"\b(\d{2}/\d{4})\s+(-?[\d\.\,]+)\b")
 
-# tipo vínculo (tolerante)
-PADRAO_TIPO_VINCULO_EMPREGADO = re.compile(r"\bTipo\s+V[ií]nculo\b.*\bEmpregado\b", re.IGNORECASE)
+# palavra Empregado isolada (valor da coluna Tipo Vínculo)
+RE_EMPREGADO = re.compile(r"\bEmpregado\b", re.IGNORECASE)
+
+# possíveis separadores de coluna (CNIS texto bruto)
+SEP_COLS = re.compile(r"\s{2,}|\t|\|")
 
 # ------------------------------------------------------------
-# FUNÇÕES AUXILIARES
+# UTILITÁRIOS
 # ------------------------------------------------------------
 
-def _to_float_ptbr(valor_txt: str) -> float:
-    # mantém literal numérica, mas converte para float pt-br
-    return float(valor_txt.replace(".", "").replace(",", "."))
+def _to_float_ptbr(txt: str) -> Optional[float]:
+    try:
+        return float(txt.replace(".", "").replace(",", "."))
+    except Exception:
+        return None
 
-def _eh_inicio_vinculo(linha: str) -> bool:
-    # aceita com/sem acento e pequenas variações
-    l = linha.lower()
-    return ("origem do vínculo" in l) or ("origem do vinculo" in l) or ("código emp" in l) or ("codigo emp" in l)
+def _split_cols(linha: str) -> List[str]:
+    # divide por múltiplos espaços / tabs / pipes
+    cols = [c.strip() for c in SEP_COLS.split(linha) if c.strip()]
+    return cols
 
-def _extrair_indicadores(linha: str) -> list:
-    m = re.search(r"Indicadores\s*:\s*(.*)", linha, re.IGNORECASE)
-    if not m:
-        return []
-    bruto = m.group(1).strip()
-    if not bruto:
-        return []
-    return [i for i in re.split(r"[\s,;]+", bruto) if i]
+def _find_empregado_col(cols: List[str]) -> bool:
+    # verdadeiro se ALGUMA coluna for exatamente/contiver "Empregado"
+    for c in cols:
+        if RE_EMPREGADO.search(c):
+            return True
+    return False
 
-def _extrair_datas_e_ultima_remun(linha: str):
-    datas = PADRAO_DATA_COMPLETA.findall(linha)
+def _extract_datas_from_cols(cols: List[str]):
+    datas = []
+    for c in cols:
+        datas.extend(RE_DATA.findall(c))
     data_inicio = datas[0] if len(datas) >= 1 else None
     data_fim = datas[1] if len(datas) >= 2 else None
+    return data_inicio, data_fim
 
-    meses_anos = PADRAO_MES_ANO.findall(linha)
-    ultima_remun = meses_anos[-1] if meses_anos else None
+def _extract_ultima_remun_from_block(block_lines: List[str]) -> Optional[str]:
+    meses = []
+    for ln in block_lines:
+        meses.extend(RE_MES_ANO.findall(ln))
+    return meses[-1] if meses else None
 
-    return data_inicio, data_fim, ultima_remun
+def _extract_indicadores(cols: List[str]) -> List[str]:
+    # indicadores costumam aparecer em coluna própria; extrai tokens literais
+    out = []
+    for c in cols:
+        if len(c) <= 6 and c.isupper():
+            out.append(c)
+    return out
 
 # ------------------------------------------------------------
-# FUNÇÃO PRINCIPAL
+# PARSER PRINCIPAL
 # ------------------------------------------------------------
 
-def parse_cnis(texto: str) -> dict:
+def parse_cnis(texto: str) -> Dict:
     """
-    Parser CNIS — CNIS CIDADÃO | SEGURADO EMPREGADO
+    CNIS CIDADÃO | SEGURADO EMPREGADO
+    Regra: cria vínculo APENAS quando linha tabular tiver Tipo Vínculo = Empregado.
     Extração literal, sem inferência.
     """
 
@@ -72,79 +90,68 @@ def parse_cnis(texto: str) -> dict:
     }
 
     # --------------------------
-    # IDENTIFICAÇÃO (literal)
+    # IDENTIFICAÇÃO
     # --------------------------
-    m_nit = PADRAO_NIT.search(texto)
-    if m_nit:
-        resultado["identificacao"]["nit"] = m_nit.group(1).strip()
+    m = RE_CPF.search(texto)
+    if m:
+        resultado["identificacao"]["cpf"] = m.group(1).strip()
 
-    m_cpf = PADRAO_CPF.search(texto)
-    if m_cpf:
-        resultado["identificacao"]["cpf"] = m_cpf.group(1).strip()
+    m = RE_NIT.search(texto)
+    if m:
+        resultado["identificacao"]["nit"] = m.group(1).strip()
 
     # --------------------------
-    # VÍNCULOS
+    # PROCESSAMENTO TABULAR
     # --------------------------
     linhas = texto.split("\n")
+
     vinculo_atual = None
+    bloco_linhas: List[str] = []
 
     for linha in linhas:
-        linha_limpa = linha.strip()
-        if not linha_limpa:
+        ln = linha.rstrip()
+        if not ln.strip():
             continue
 
-        # --- início do vínculo (cabeçalho) ---
-        if _eh_inicio_vinculo(linha_limpa):
-            # fecha o vínculo anterior SOMENTE se for EMPREGADO
-            if vinculo_atual and vinculo_atual.get("tipo_vinculo") == "EMPREGADO":
+        cols = _split_cols(ln)
+
+        # --- GATILHO: linha tabular com "Empregado" ---
+        if cols and _find_empregado_col(cols):
+            # fecha vínculo anterior
+            if vinculo_atual:
+                # fecha última remuneração pelo bloco acumulado
+                vinculo_atual["ultima_remuneracao"] = _extract_ultima_remun_from_block(bloco_linhas)
                 resultado["vinculos"].append(vinculo_atual)
 
-            data_inicio, data_fim, ultima_remun = _extrair_datas_e_ultima_remun(linha_limpa)
+            data_inicio, data_fim = _extract_datas_from_cols(cols)
 
-            # cria vínculo "pendente": tipo ainda pode aparecer em linhas seguintes
             vinculo_atual = {
-                "tipo_vinculo": None,  # será preenchido quando encontrarmos "Tipo Vínculo: Empregado"
+                "tipo_vinculo": "EMPREGADO",
                 "data_inicio": data_inicio,
                 "data_fim": data_fim,
-                "ultima_remuneracao": ultima_remun,
+                "ultima_remuneracao": None,
                 "matricula": None,
-                "indicadores": _extrair_indicadores(linha_limpa),
+                "indicadores": _extract_indicadores(cols),
                 "remuneracoes": []
             }
+            bloco_linhas = []
             continue
 
-        # se não há vínculo atual, ignora
-        if not vinculo_atual:
-            continue
-
-        # --- detectar tipo vínculo em linhas seguintes ---
-        if vinculo_atual.get("tipo_vinculo") is None:
-            if PADRAO_TIPO_VINCULO_EMPREGADO.search(linha_limpa):
-                vinculo_atual["tipo_vinculo"] = "EMPREGADO"
-                continue
-
-        # --- remunerações (só coleta se for EMPREGADO) ---
-        if vinculo_atual.get("tipo_vinculo") == "EMPREGADO":
-            match = PADRAO_REMUNERACAO.search(linha_limpa)
-            if match:
-                competencia = match.group(1)
-                valor_txt = match.group(2)
-
-                # pelo P&R: valor negativo deve ser extraído (não bloquear)
-                # aqui só armazenamos o valor numérico; marcações vêm depois
-                try:
-                    valor = _to_float_ptbr(valor_txt)
-                except Exception:
-                    # se der erro de conversão, mantém como None (literal sem inferência)
-                    valor = None
-
+        # --- COLETA DE REMUNERAÇÕES (somente se já houver vínculo EMPREGADO) ---
+        if vinculo_atual and vinculo_atual.get("tipo_vinculo") == "EMPREGADO":
+            bloco_linhas.append(ln)
+            mrem = RE_REMUN.search(ln)
+            if mrem:
+                competencia = mrem.group(1)
+                valor = _to_float_ptbr(mrem.group(2))
                 vinculo_atual["remuneracoes"].append({
                     "competencia": competencia,
                     "valor": valor
                 })
 
-    # fecha o último vínculo SOMENTE se for EMPREGADO
-    if vinculo_atual and vinculo_atual.get("tipo_vinculo") == "EMPREGADO":
+    # fecha último vínculo
+    if vinculo_atual:
+        vinculo_atual["ultima_remuneracao"] = _extract_ultima_remun_from_block(bloco_linhas)
         resultado["vinculos"].append(vinculo_atual)
 
     return resultado
