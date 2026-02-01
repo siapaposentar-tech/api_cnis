@@ -1,175 +1,130 @@
+# ============================================================
+# PARSER CNIS — PROVISÓRIO
+# ESCOPO: CNIS CIDADÃO | SEGURADO EMPREGADO
+# STATUS: FUNCIONAL — PASSO 1 APLICADO
+# GOVERNANÇA: SUBORDINADO AO P&R CNIS — EMPREGADO
+# ============================================================
+
 import re
-from datetime import datetime
 
-# =========================================================
-# FUNÇÃO AUXILIAR
-# =========================================================
+# ------------------------------------------------------------
+# PADRÕES REGEX
+# ------------------------------------------------------------
 
-def gerar_competencias_esperadas(inicio, fim):
+PADRAO_DATA_COMPLETA = re.compile(r"\b\d{2}/\d{2}/\d{4}\b")
+PADRAO_MES_ANO = re.compile(r"\b\d{2}/\d{4}\b")
+PADRAO_REMUNERACAO = re.compile(r"(\d{2}/\d{4})\s+([\d\.\,]+)")
+
+# ------------------------------------------------------------
+# FUNÇÕES AUXILIARES
+# ------------------------------------------------------------
+
+def _to_float_ptbr(valor_txt: str) -> float:
+    return float(valor_txt.replace(".", "").replace(",", "."))
+
+def _eh_inicio_vinculo(linha: str) -> bool:
+    return bool(
+        re.search(r"Origem do Vínculo", linha, re.IGNORECASE)
+        or re.search(r"C[oó]digo\s+Emp", linha, re.IGNORECASE)
+    )
+
+def _extrair_tipo_vinculo(linha: str):
+    if re.search(r"\bEmpregado\b", linha, re.IGNORECASE):
+        return "EMPREGADO"
+    return None
+
+def _extrair_indicadores(linha: str) -> list:
+    m = re.search(r"Indicadores\s*:\s*(.*)", linha, re.IGNORECASE)
+    if not m:
+        return []
+    bruto = m.group(1).strip()
+    if not bruto:
+        return []
+    return [i for i in re.split(r"[\s,;]+", bruto) if i]
+
+def _extrair_datas_e_ultima_remun(linha: str):
+    datas = PADRAO_DATA_COMPLETA.findall(linha)
+    data_inicio = datas[0] if len(datas) >= 1 else None
+    data_fim = datas[1] if len(datas) >= 2 else None
+
+    meses_anos = PADRAO_MES_ANO.findall(linha)
+    ultima_remun = meses_anos[-1] if meses_anos else None
+
+    return data_inicio, data_fim, ultima_remun
+
+# ------------------------------------------------------------
+# FUNÇÃO PRINCIPAL
+# ------------------------------------------------------------
+
+def parse_cnis(texto: str) -> dict:
     """
-    Gera competências esperadas (MM/YYYY) somente
-    quando as datas são completas e válidas.
-
-    Regras CNIS CIDADÃO – SEGURADO EMPREGADO:
-    - inicio: dd/mm/aaaa
-    - fim: mm/aaaa
-    - qualquer inconsistência → lista vazia
+    Parser CNIS — CNIS CIDADÃO | SEGURADO EMPREGADO
+    Extração literal, sem inferência.
     """
 
-    if not inicio or not fim:
-        return []
-
-    try:
-        data_inicio = datetime.strptime(inicio, "%d/%m/%Y")
-    except ValueError:
-        return []
-
-    try:
-        data_fim = datetime.strptime(fim, "%m/%Y")
-    except ValueError:
-        return []
-
-    competencias = []
-    ano = data_inicio.year
-    mes = data_inicio.month
-
-    while (ano < data_fim.year) or (ano == data_fim.year and mes <= data_fim.month):
-        competencias.append(f"{mes:02d}/{ano}")
-        mes += 1
-        if mes > 12:
-            mes = 1
-            ano += 1
-
-    return competencias
-
-
-# =========================================================
-# PARSER PRINCIPAL — CNIS CIDADÃO
-# ESCOPO ATUAL: SEGURADO EMPREGADO
-# REGRA: SEMPRE NOVO VÍNCULO AO VER "EMPREGADO"
-# =========================================================
-
-def parse_cnis(texto):
     resultado = {
         "identificacao": {},
         "vinculos": []
     }
 
-    linhas = [l.strip() for l in texto.split("\n") if l.strip()]
+    # --------------------------------------------------------
+    # IDENTIFICAÇÃO BÁSICA
+    # --------------------------------------------------------
 
-    # -----------------------------------------------------
-    # IDENTIFICAÇÃO
-    # -----------------------------------------------------
+    nit = re.search(r"NIT:\s*([\d\.\-]+)", texto)
+    if nit:
+        resultado["identificacao"]["nit"] = nit.group(1).strip()
 
-    for linha in linhas:
-        if linha.startswith("Nome:"):
-            resultado["identificacao"]["nome"] = linha.replace("Nome:", "").strip()
+    cpf = re.search(r"CPF:\s*([\d\.\-]+)", texto)
+    if cpf:
+        resultado["identificacao"]["cpf"] = cpf.group(1).strip()
 
-        if "CPF:" in linha:
-            m = re.search(r"CPF:\s*([\d\.\-]+)", linha)
-            if m:
-                resultado["identificacao"]["cpf"] = m.group(1)
+    # --------------------------------------------------------
+    # PROCESSAMENTO DE VÍNCULOS
+    # --------------------------------------------------------
 
-        if "NIT:" in linha or "Nit:" in linha:
-            m = re.search(r"(NIT|Nit):\s*([\d\.\-]+)", linha)
-            if m:
-                resultado["identificacao"]["nit"] = m.group(2)
-
-    # -----------------------------------------------------
-    # VÍNCULOS — SOMENTE EMPREGADO (OPÇÃO B)
-    # -----------------------------------------------------
-
+    linhas = texto.split("\n")
     vinculo_atual = None
-    dentro_relacoes = False
-    aguardando_tipo = False
 
     for linha in linhas:
 
-        if "Relações Previdenciárias" in linha:
-            dentro_relacoes = True
-            continue
+        # ---------------- INÍCIO DE VÍNCULO -----------------
+        if _eh_inicio_vinculo(linha):
 
-        if not dentro_relacoes:
-            continue
-
-        # Campo Tipo Vínculo
-        if "Tipo Vínculo" in linha:
-            aguardando_tipo = True
-            continue
-
-        # Valor do Tipo Vínculo
-        if aguardando_tipo:
-            aguardando_tipo = False
-
-            if "Empregado" in linha:
-                # SEMPRE cria novo vínculo
-                vinculo_atual = {
-                    "tipo_vinculo": "EMPREGADO",
-                    "data_inicio": None,
-                    "data_fim": None,
-                    "ultima_remuneracao": None,
-                    "matricula": None,
-                    "competencias_encontradas": [],
-                    "competencias_esperadas": [],
-                    "competencias_sem_remuneracao": []
-                }
+            if vinculo_atual and vinculo_atual.get("tipo_vinculo") == "EMPREGADO":
                 resultado["vinculos"].append(vinculo_atual)
-            else:
-                vinculo_atual = None
 
+            data_inicio, data_fim, ultima_remun = _extrair_datas_e_ultima_remun(linha)
+
+            vinculo_atual = {
+                "tipo_vinculo": _extrair_tipo_vinculo(linha),
+                "data_inicio": data_inicio,
+                "data_fim": data_fim,
+                "ultima_remuneracao": ultima_remun,
+                "matricula": None,
+                "indicadores": _extrair_indicadores(linha),
+                "remuneracoes": []
+            }
             continue
 
-        if not vinculo_atual:
-            continue
+        # ---------------- REMUNERAÇÕES -----------------
+        if vinculo_atual and vinculo_atual.get("tipo_vinculo") == "EMPREGADO":
+            match = PADRAO_REMUNERACAO.search(linha)
+            if match:
+                vinculo_atual["remuneracoes"].append({
+                    "competencia": match.group(1),
+                    "valor": _to_float_ptbr(match.group(2))
+                })
 
-        # Data Início
-        if "Data Início:" in linha:
-            m = re.search(r"(\d{2}/\d{2}/\d{4})", linha)
-            if m:
-                vinculo_atual["data_inicio"] = m.group(1)
+    # --------------------------------------------------------
+    # FECHAMENTO DO ÚLTIMO VÍNCULO
+    # --------------------------------------------------------
 
-        # Data Fim
-        if "Data Fim:" in linha:
-            m = re.search(r"(\d{2}/\d{2}/\d{4})", linha)
-            if m:
-                vinculo_atual["data_fim"] = m.group(1)
-
-        # Última Remuneração
-        if "Últ. Remun." in linha:
-            m = re.search(r"(\d{2}/\d{4})", linha)
-            if m:
-                vinculo_atual["ultima_remuneracao"] = m.group(1)
-
-        # Matrícula do Trabalhador
-        if "Matrícula do Trabalhador" in linha:
-            m = re.search(r":\s*(\S+)", linha)
-            if m:
-                valor = m.group(1)
-                if not re.match(r"\d{2}/\d{4}", valor):
-                    vinculo_atual["matricula"] = valor
-
-        # Competências
-        m = re.search(r"(\d{2}/\d{4})\s+([\d\.,]+)", linha)
-        if m:
-            vinculo_atual["competencias_encontradas"].append(m.group(1))
-
-    # -----------------------------------------------------
-    # PÓS-PROCESSAMENTO
-    # -----------------------------------------------------
-
-    for v in resultado["vinculos"]:
-        inicio = v["data_inicio"]
-        fim = None
-
-        if v["data_fim"]:
-            fim = v["data_fim"][3:]
-        elif v["ultima_remuneracao"]:
-            fim = v["ultima_remuneracao"]
-
-        v["competencias_esperadas"] = gerar_competencias_esperadas(inicio, fim)
-        v["competencias_sem_remuneracao"] = [
-            c for c in v["competencias_esperadas"]
-            if c not in v["competencias_encontradas"]
-        ]
+    if vinculo_atual and vinculo_atual.get("tipo_vinculo") == "EMPREGADO":
+        resultado["vinculos"].append(vinculo_atual)
 
     return resultado
+
+# ============================================================
+# FIM DO ARQUIVO — parsers/parser_cnis.py
+# ============================================================
