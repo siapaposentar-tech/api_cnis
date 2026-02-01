@@ -46,6 +46,7 @@ def gerar_competencias_esperadas(inicio, fim):
 # =========================================================
 # PARSER PRINCIPAL — CNIS CIDADÃO
 # ESCOPO ATUAL: SEGURADO EMPREGADO
+# REGRA: SEMPRE NOVO VÍNCULO AO VER "EMPREGADO"
 # =========================================================
 
 def parse_cnis(texto):
@@ -75,7 +76,7 @@ def parse_cnis(texto):
                 resultado["identificacao"]["nit"] = m.group(2)
 
     # -----------------------------------------------------
-    # VÍNCULOS — SOMENTE EMPREGADO
+    # VÍNCULOS — SOMENTE EMPREGADO (OPÇÃO B)
     # -----------------------------------------------------
 
     vinculo_atual = None
@@ -84,7 +85,6 @@ def parse_cnis(texto):
 
     for linha in linhas:
 
-        # Entrada no bloco de relações previdenciárias
         if "Relações Previdenciárias" in linha:
             dentro_relacoes = True
             continue
@@ -92,7 +92,7 @@ def parse_cnis(texto):
         if not dentro_relacoes:
             continue
 
-        # Detecta campo Tipo Vínculo
+        # Campo Tipo Vínculo
         if "Tipo Vínculo" in linha:
             aguardando_tipo = True
             continue
@@ -102,11 +102,7 @@ def parse_cnis(texto):
             aguardando_tipo = False
 
             if "Empregado" in linha:
-                # Fecha vínculo anterior
-                if vinculo_atual:
-                    resultado["vinculos"].append(vinculo_atual)
-
-                # Abre novo vínculo EMPREGADO
+                # SEMPRE cria novo vínculo
                 vinculo_atual = {
                     "tipo_vinculo": "EMPREGADO",
                     "data_inicio": None,
@@ -117,8 +113,8 @@ def parse_cnis(texto):
                     "competencias_esperadas": [],
                     "competencias_sem_remuneracao": []
                 }
+                resultado["vinculos"].append(vinculo_atual)
             else:
-                # Outros vínculos ignorados por enquanto
                 vinculo_atual = None
 
             continue
@@ -152,14 +148,10 @@ def parse_cnis(texto):
                 if not re.match(r"\d{2}/\d{4}", valor):
                     vinculo_atual["matricula"] = valor
 
-        # Competências (MM/YYYY)
+        # Competências
         m = re.search(r"(\d{2}/\d{4})\s+([\d\.,]+)", linha)
         if m:
             vinculo_atual["competencias_encontradas"].append(m.group(1))
-
-    # Fecha último vínculo
-    if vinculo_atual:
-        resultado["vinculos"].append(vinculo_atual)
 
     # -----------------------------------------------------
     # PÓS-PROCESSAMENTO
