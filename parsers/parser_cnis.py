@@ -1,11 +1,13 @@
 import re
+from datetime import datetime
 
-# ==============================
-# PARSER CNIS — BASE INCREMENTAL
-# CNIS CIDADÃO | SEGURADO EMPREGADO
-# ==============================
+# =====================================================
+# PARSER CNIS — CNIS CIDADÃO | SEGURADO EMPREGADO
+# =====================================================
 
-COMP_REGEX = re.compile(r"(0[1-9]|1[0-2])/\d{4}")
+REGEX_DATA_COMPLETA = re.compile(r"\d{2}/\d{2}/\d{4}")
+REGEX_COMPETENCIA = re.compile(r"(0[1-9]|1[0-2])/\d{4}")
+REGEX_NUMERO = re.compile(r"^\d+$")
 
 HEADER_MARKERS = [
     "competência",
@@ -15,40 +17,47 @@ HEADER_MARKERS = [
 ]
 
 def is_header_line(linha: str) -> bool:
-    texto = linha.lower()
-    return any(m in texto for m in HEADER_MARKERS)
+    return any(h in linha.lower() for h in HEADER_MARKERS)
 
 def extrair_competencias_horizontal(linhas):
     """
-    Leitura HORIZONTAL das competências:
-    - esquerda → direita
-    - até 3 por linha
-    - continua linha a linha e página a página
-    - ignora cabeçalhos repetidos
-    - NÃO cria lacuna por branco visual
+    CNIS CIDADÃO | SEGURADO EMPREGADO
+    Leitura horizontal das competências:
+    esquerda → direita, linha a linha, página a página.
     """
     competencias = []
 
     for linha in linhas:
         if not linha.strip():
             continue
-
         if is_header_line(linha):
             continue
 
-        encontrados = [m.group(0) for m in re.finditer(COMP_REGEX, linha)]
-
+        encontrados = [m.group(0) for m in re.finditer(REGEX_COMPETENCIA, linha)]
         for comp in encontrados:
             competencias.append(comp)
 
     return competencias
 
-def parse_cnis(texto):
+def gerar_competencias_esperadas(inicio, fim):
     """
-    Parser CNIS Cidadão.
-    Extração literal e incremental.
+    Gera todas as competências entre duas datas (mm/aaaa).
     """
+    competencias = []
+    data_inicio = datetime.strptime(inicio, "%m/%Y")
+    data_fim = datetime.strptime(fim, "%m/%Y")
 
+    atual = data_inicio
+    while atual <= data_fim:
+        competencias.append(atual.strftime("%m/%Y"))
+        if atual.month == 12:
+            atual = atual.replace(year=atual.year + 1, month=1)
+        else:
+            atual = atual.replace(month=atual.month + 1)
+
+    return competencias
+
+def parse_cnis(texto):
     resultado = {
         "identificacao": {},
         "vinculos": []
@@ -57,9 +66,8 @@ def parse_cnis(texto):
     linhas = texto.split("\n")
 
     # ------------------------------
-    # IDENTIFICAÇÃO DO SEGURADO
+    # IDENTIFICAÇÃO
     # ------------------------------
-
     nome = re.search(r"Nome:\s*(.*)", texto)
     if nome:
         resultado["identificacao"]["nome"] = nome.group(1).strip()
@@ -73,31 +81,78 @@ def parse_cnis(texto):
         resultado["identificacao"]["nit"] = nit.group(1).strip()
 
     # ------------------------------
-    # VÍNCULOS E REMUNERAÇÕES
+    # VÍNCULOS
     # ------------------------------
-
     bloco_atual = None
     linhas_remuneracao = []
 
     for linha in linhas:
-        # Detecta início de vínculo
-        if re.search(r"Origem do Vínculo|Código Emp\.", linha, re.IGNORECASE):
+        if re.search(r"Origem do Vínculo|Código Emp", linha, re.IGNORECASE):
             if bloco_atual:
-                bloco_atual["competencias"] = extrair_competencias_horizontal(linhas_remuneracao)
+                bloco_atual["competencias_encontradas"] = extrair_competencias_horizontal(linhas_remuneracao)
                 resultado["vinculos"].append(bloco_atual)
 
             bloco_atual = {
                 "linha_inicio": linha.strip(),
-                "competencias": []
+                "data_inicio": None,
+                "data_fim": None,
+                "ultima_remuneracao": None,
+                "matricula": None,
+                "competencias_encontradas": [],
+                "competencias_esperadas": [],
+                "competencias_sem_remuneracao": []
             }
             linhas_remuneracao = []
             continue
 
-        if bloco_atual is not None:
+        if bloco_atual:
+            # Detecta datas completas
+            datas = REGEX_DATA_COMPLETA.findall(linha)
+            for d in datas:
+                if not bloco_atual["data_inicio"]:
+                    bloco_atual["data_inicio"] = d
+                elif not bloco_atual["data_fim"]:
+                    bloco_atual["data_fim"] = d
+
+            # Detecta última remuneração (mm/aaaa)
+            comps = REGEX_COMPETENCIA.findall(linha)
+            if comps:
+                bloco_atual["ultima_remuneracao"] = comps[-1]
+
+            # Detecta matrícula (número isolado)
+            tokens = linha.split()
+            for t in tokens:
+                if REGEX_NUMERO.match(t):
+                    bloco_atual["matricula"] = t
+
             linhas_remuneracao.append(linha)
 
     if bloco_atual:
-        bloco_atual["competencias"] = extrair_competencias_horizontal(linhas_remuneracao)
+        bloco_atual["competencias_encontradas"] = extrair_competencias_horizontal(linhas_remuneracao)
         resultado["vinculos"].append(bloco_atual)
+
+    # ------------------------------
+    # CÁLCULO DE LACUNAS
+    # ------------------------------
+    for v in resultado["vinculos"]:
+        if not v["data_inicio"]:
+            continue
+
+        inicio = datetime.strptime(v["data_inicio"], "%d/%m/%Y").strftime("%m/%Y")
+
+        if v["data_fim"]:
+            fim = datetime.strptime(v["data_fim"], "%d/%m/%Y").strftime("%m/%Y")
+        else:
+            fim = v["ultima_remuneracao"]
+
+        if not fim:
+            continue
+
+        v["competencias_esperadas"] = gerar_competencias_esperadas(inicio, fim)
+
+        encontradas = set(v["competencias_encontradas"])
+        v["competencias_sem_remuneracao"] = [
+            c for c in v["competencias_esperadas"] if c not in encontradas
+        ]
 
     return resultado
