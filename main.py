@@ -1,24 +1,47 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import JSONResponse
+import pdfplumber
+
 from parsers.parser_cnis import parse_cnis
 
-app = FastAPI(
-    title="API CNIS – SIAP",
-    description="API de extração de CNIS (Cidadão e Extrato Previdenciário) do projeto SIAP.",
-    version="1.0.0"
-)
+app = FastAPI()
 
-# Modelo para receber o texto do CNIS
-class CNISInput(BaseModel):
-    texto: str
-
-# Rota simples para testar funcionamento
 @app.get("/")
-def home():
+def health_check():
     return {"status": "ok", "mensagem": "API CNIS está funcionando."}
 
-# Rota oficial de processamento
+
 @app.post("/processar_cnis")
-def processar_cnis(dados: CNISInput):
-    resultado = parse_cnis(dados.texto)
-    return {"status": "sucesso", "resultado": resultado}
+async def processar_cnis_pdf(file: UploadFile = File(...)):
+    """
+    Endpoint para receber PDF do CNIS Cidadão
+    Extrai texto preservando quebras de linha
+    e envia para o parser.
+    """
+
+    if not file.filename.lower().endswith(".pdf"):
+        return JSONResponse(
+            status_code=400,
+            content={"erro": "Envie um arquivo PDF"}
+        )
+
+    texto_extraido = ""
+
+    with pdfplumber.open(file.file) as pdf:
+        for pagina in pdf.pages:
+            texto_pagina = pagina.extract_text()
+            if texto_pagina:
+                texto_extraido += texto_pagina + "\n"
+
+    if not texto_extraido.strip():
+        return JSONResponse(
+            status_code=400,
+            content={"erro": "Não foi possível extrair texto do PDF"}
+        )
+
+    resultado = parse_cnis(texto_extraido)
+
+    return {
+        "status": "sucesso",
+        "resultado": resultado
+    }
