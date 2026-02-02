@@ -1,27 +1,24 @@
 # ============================================================
-# PARSER CNIS — PROVISÓRIO (EVOLUÇÃO INCREMENTAL)
+# PARSER CNIS — parsers/parser_cnis.py
 # ESCOPO: CNIS CIDADÃO | SEGURADO EMPREGADO
-# REGRA-CHAVE: cria vínculo APENAS quando Tipo Vínculo = Empregado
-# GOVERNANÇA: SUBORDINADO AO P&R CNIS — EMPREGADO
-#
-# ATUALIZAÇÃO (2026-02-01):
-# - Extrair também: Sequencial, Nome da Empresa, Código Emp./NB (CNPJ/CEI/raiz), Origem do Vínculo
-# - Correção no momento da detecção: deslocamento de coluna (ex.: matrícula no lugar de Data Fim)
-# - Bloqueio de vínculo fantasma (não salva vínculo sem data_inicio e sem identificadores mínimos)
+# REGRA-CHAVE: cria vínculo APENAS quando a linha do vínculo
+#              contém "Empregado" + data DD/MM/AAAA e inicia
+#              com SEQUENCIAL numérico.
+# EXTRAÇÃO: literal, sem inferência fora do escopo.
 # ============================================================
 
 import re
 from typing import List, Dict, Optional, Tuple
 
 # ------------------------------------------------------------
-# REGEX BÁSICOS (tolerantes)
+# REGEX BÁSICOS
 # ------------------------------------------------------------
 
 RE_CPF = re.compile(r"\bCPF\b\s*[:\-]?\s*([\d\.\-]+)", re.IGNORECASE)
-RE_NIT = re.compile(r"\bNIT\b\s*[:\-]?\s*([\d\.\-]+)", re.IGNORECASE)
+RE_NIT_ID = re.compile(r"\bNIT\b\s*[:\-]?\s*([\d\.\-]+)", re.IGNORECASE)
 
-# NIT dentro de colunas tabulares (ex.: 1.112.798.857-8)
-RE_NIT_TOKEN = re.compile(r"\b\d{1,3}\.\d{3}\.\d{3}\.\d{3}\-\d\b")
+# NIT em formato usual do CNIS (ex.: 1.112.798.857-8)
+RE_NIT_VAL = re.compile(r"\b\d\.\d{3}\.\d{3}\.\d{3}-\d\b")
 
 # datas
 RE_DATA = re.compile(r"\b\d{2}/\d{2}/\d{4}\b")
@@ -30,17 +27,24 @@ RE_MES_ANO = re.compile(r"\b\d{2}/\d{4}\b")
 # remuneração: "MM/AAAA 1.234,56" (valor pode ser negativo)
 RE_REMUN = re.compile(r"\b(\d{2}/\d{4})\s+(-?[\d\.\,]+)\b")
 
-# palavra Empregado isolada (valor da coluna Tipo Vínculo)
-RE_EMPREGADO = re.compile(r"\bEmpregado\b", re.IGNORECASE)
+# palavra Empregado (token)
+RE_EMPREGADO_TOKEN = re.compile(r"\bEmpregado\b", re.IGNORECASE)
+
+# CNPJ (padrão clássico)
+RE_CNPJ = re.compile(r"\b\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\b")
+
+# CEI / outros códigos possíveis (heurística conservadora)
+# (mantemos simples: sequências com muitos dígitos e separadores comuns)
+RE_CODIGO_EMP_ALT = re.compile(r"\b\d{2}\.\d{3}\.\d{3}\.\d{2}-\d\b|\b\d{11,14}\b")
+
+# sequencial no início da linha
+RE_SEQ_INICIO = re.compile(r"^\s*(\d{1,4})\s+")
+
+# indicadores (tokens em maiúsculo, com números/underscore)
+RE_IND_TOKENS = re.compile(r"\b[A-Z][A-Z0-9_]{1,15}\b")
 
 # possíveis separadores de coluna (CNIS texto bruto)
 SEP_COLS = re.compile(r"\s{2,}|\t|\|")
-
-# CNPJ / CEI / NB (extração literal)
-RE_CNPJ_FORMATADO = re.compile(r"\b\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\b")
-RE_CNPJ_SEM_MASCARA = re.compile(r"\b\d{14}\b")
-RE_CEI_FORMATADO = re.compile(r"\b\d{2}\.\d{3}\.\d{5}/\d{2}\b")
-RE_CEI_SEM_MASCARA = re.compile(r"\b\d{12}\b")
 
 # ------------------------------------------------------------
 # UTILITÁRIOS
@@ -53,24 +57,140 @@ def _to_float_ptbr(txt: str) -> Optional[float]:
         return None
 
 def _split_cols(linha: str) -> List[str]:
-    # divide por múltiplos espaços / tabs / pipes
     cols = [c.strip() for c in SEP_COLS.split(linha) if c.strip()]
     return cols
 
-def _find_empregado_col(cols: List[str]) -> bool:
-    # verdadeiro se ALGUMA coluna contiver "Empregado"
-    for c in cols:
-        if RE_EMPREGADO.search(c):
-            return True
-    return False
+def _is_likely_vinculo_line(raw_line: str) -> bool:
+    """
+    Linha de vínculo válida (para CRIAR vínculo):
+    - começa com sequencial numérico
+    - contém token Empregado
+    - contém pelo menos 1 data DD/MM/AAAA (início)
+    """
+    if not RE_SEQ_INICIO.search(raw_line):
+        return False
+    if not RE_EMPREGADO_TOKEN.search(raw_line):
+        return False
+    if not RE_DATA.search(raw_line):
+        return False
+    # proteção: evita cabeçalhos tipo "Indicador Descrição" etc
+    if "Indicador" in raw_line and "Descrição" in raw_line:
+        return False
+    return True
 
-def _extract_datas_from_cols(cols: List[str]) -> Tuple[Optional[str], Optional[str]]:
-    datas = []
-    for c in cols:
-        datas.extend(RE_DATA.findall(c))
-    data_inicio = datas[0] if len(datas) >= 1 else None
-    data_fim = datas[1] if len(datas) >= 2 else None
-    return data_inicio, data_fim
+def _extract_datas_from_line(line: str) -> Tuple[Optional[str], Optional[str], int, int]:
+    """
+    Retorna:
+    data_inicio, data_fim, idx_inicio_data1, idx_fim_ultima_data
+    """
+    datas = list(RE_DATA.finditer(line))
+    if not datas:
+        return None, None, -1, -1
+    data_inicio = datas[0].group(0)
+    data_fim = datas[1].group(0) if len(datas) >= 2 else None
+    idx_inicio_data1 = datas[0].start()
+    idx_fim_ultima_data = datas[-1].end()
+    return data_inicio, data_fim, idx_inicio_data1, idx_fim_ultima_data
+
+def _extract_nit_and_codigo_and_empresa(line: str, idx_inicio_data: int) -> Tuple[Optional[int], Optional[str], Optional[str], Optional[str]]:
+    """
+    Regra fixada pelo Ronaldo:
+    - Nome da empresa está SEMPRE entre o CNPJ/CEI e a Data de Início.
+    Extraímos:
+    - sequencial (int)
+    - nit_vinculo (str) = NIT limpo encontrado na linha
+    - codigo_emp (str) = CNPJ/CEI
+    - nome_empresa (str) = trecho restante antes da data
+    """
+    raw = line.strip()
+
+    # sequencial
+    mseq = RE_SEQ_INICIO.search(raw)
+    sequencial = int(mseq.group(1)) if mseq else None
+
+    # pega somente a parte antes da primeira data (onde ficam seq/nit/codigo/nome)
+    pre = raw[:idx_inicio_data].strip()
+
+    # remove sequencial do começo
+    if mseq:
+        pre = pre[mseq.end():].strip()
+
+    # NIT do vínculo (primeiro NIT que aparecer)
+    nit_vinculo = None
+    mnit = RE_NIT_VAL.search(pre)
+    if mnit:
+        nit_vinculo = mnit.group(0)
+        pre = (pre[:mnit.start()] + " " + pre[mnit.end():]).strip()
+
+    # código do empregador (prioriza CNPJ)
+    codigo_emp = None
+    mc = RE_CNPJ.search(pre)
+    if mc:
+        codigo_emp = mc.group(0)
+        pre = (pre[:mc.start()] + " " + pre[mc.end():]).strip()
+    else:
+        # tenta CEI/alternativos, mas só se houver algo com cara de código
+        mc2 = RE_CODIGO_EMP_ALT.search(pre)
+        if mc2:
+            codigo_emp = mc2.group(0)
+            pre = (pre[:mc2.start()] + " " + pre[mc2.end():]).strip()
+
+    # o que sobra é o nome da empresa (regra: fica entre codigo e data)
+    nome_empresa = pre.strip() if pre.strip() else None
+
+    return sequencial, nit_vinculo, codigo_emp, nome_empresa
+
+def _extract_matricula_and_indicadores(line: str, idx_fim_ultima_data: int) -> Tuple[Optional[str], List[str], Optional[str]]:
+    """
+    Após a(s) data(s), antes/apos "Empregado" podem existir:
+    - matrícula / código interno (ex.: 3062691, KRTC006S016336)
+    - última remuneração (MM/AAAA) às vezes aparece na linha do vínculo
+    - indicadores (AVRC, PEXT, PRPPS, IEAN...)
+    """
+    matricula = None
+    ultima_remun_linha = None
+
+    # encontra posição de "Empregado"
+    memp = RE_EMPREGADO_TOKEN.search(line)
+    if not memp:
+        return None, [], None
+
+    # trecho entre o fim da última data e a palavra Empregado
+    mid = line[idx_fim_ultima_data:memp.start()].strip()
+
+    # se existir MM/AAAA aqui, pode ser última remuneração
+    meses = RE_MES_ANO.findall(mid)
+    if meses:
+        ultima_remun_linha = meses[-1]
+
+    # tenta extrair matrícula: primeiro token "forte" que não seja MM/AAAA
+    # (aceita alfanumérico com tamanho >= 4)
+    tokens = [t for t in re.split(r"\s+", mid) if t.strip()]
+    for t in tokens:
+        if RE_MES_ANO.fullmatch(t):
+            continue
+        if re.fullmatch(r"[A-Za-z0-9\-_/]{4,40}", t):
+            matricula = t
+            break
+
+    # indicadores: tudo depois de "Empregado"
+    after = line[memp.end():]
+    inds = []
+    for tok in RE_IND_TOKENS.findall(after):
+        # evita incluir palavras comuns que não são indicadores
+        if tok.upper() in ("CPF", "NIT"):
+            continue
+        inds.append(tok)
+
+    # remove duplicados preservando ordem
+    seen = set()
+    indicadores = []
+    for i in inds:
+        if i not in seen:
+            seen.add(i)
+            indicadores.append(i)
+
+    return matricula, indicadores, ultima_remun_linha
 
 def _extract_ultima_remun_from_block(block_lines: List[str]) -> Optional[str]:
     meses = []
@@ -78,82 +198,17 @@ def _extract_ultima_remun_from_block(block_lines: List[str]) -> Optional[str]:
         meses.extend(RE_MES_ANO.findall(ln))
     return meses[-1] if meses else None
 
-def _extract_indicadores(cols: List[str]) -> List[str]:
-    # indicadores costumam aparecer em coluna própria; extrai tokens literais
-    out = []
-    for c in cols:
-        token = c.strip()
-        if len(token) <= 10 and token.isupper():
-            out.append(token)
-    return out
-
-def _extract_codigo_emp(cols: List[str]) -> Optional[str]:
-    # Extrai literalmente o primeiro token que pareça CNPJ/CEI (com ou sem máscara)
-    for c in cols:
-        m = RE_CNPJ_FORMATADO.search(c)
-        if m:
-            return m.group(0)
-        m = RE_CNPJ_SEM_MASCARA.search(c)
-        if m:
-            return m.group(0)
-        m = RE_CEI_FORMATADO.search(c)
-        if m:
-            return m.group(0)
-        m = RE_CEI_SEM_MASCARA.search(c)
-        if m:
-            return m.group(0)
-
-    # fallback literal: token com bastante dígito e não sendo data/mes-ano
-    for c in cols:
-        if RE_DATA.search(c) or RE_MES_ANO.search(c):
-            continue
-        digits = re.sub(r"\D", "", c)
-        if len(digits) >= 8 and ("/" in c or "." in c or "-" in c or c.isdigit()):
-            return c.strip()
-
-    return None
-
-def _find_nit_index(cols: List[str]) -> Optional[int]:
-    for i, c in enumerate(cols):
-        if RE_NIT_TOKEN.search(c):
-            return i
-    return None
-
-def _is_numeric_token(tok: str) -> bool:
-    return bool(tok) and tok.strip().isdigit()
-
-def _safe_get(cols: List[str], idx: int) -> Optional[str]:
-    if idx < 0 or idx >= len(cols):
-        return None
-    val = cols[idx].strip()
-    return val if val else None
-
-def _extract_nome_empresa(linha_acima: Optional[str], cols_acima: List[str]) -> Optional[str]:
-    if not linha_acima:
-        return None
-    upper = linha_acima.upper()
-    # evitar cabeçalhos
-    if "SEQUENCIAL" in upper or "CÓD" in upper or "COD" in upper or "ORIGEM" in upper or "TIPO" in upper:
-        return None
-    if cols_acima and _find_empregado_col(cols_acima):
-        return None
-    # Opção A: literal
-    return linha_acima.strip()
-
-def _should_append_vinculo(v: Dict) -> bool:
-    # Bloqueio de vínculo fantasma: precisa ter algo mínimo além do tipo
-    if not v:
-        return False
-    if v.get("tipo_vinculo") != "EMPREGADO":
-        return False
-    has_min = any([
-        v.get("data_inicio"),
-        v.get("sequencial"),
-        v.get("codigo_emp"),
-        v.get("nome_empresa"),
-        v.get("nit_vinculo"),
-    ])
-    return bool(has_min)
+def _is_noise_line_for_remun(line: str) -> bool:
+    """
+    Filtro mínimo para reduzir lixo (ex.: rodapé, cabeçalhos).
+    Mantemos conservador, pois o ajuste fino será feito depois.
+    """
+    low = line.lower()
+    if "emitido" in low or "página" in low or "pagina" in low:
+        return True
+    if "indicador" in line and "descrição" in line.lower():
+        return True
+    return False
 
 # ------------------------------------------------------------
 # PARSER PRINCIPAL
@@ -162,8 +217,11 @@ def _should_append_vinculo(v: Dict) -> bool:
 def parse_cnis(texto: str) -> Dict:
     """
     CNIS CIDADÃO | SEGURADO EMPREGADO
-    Regra: cria vínculo APENAS quando linha tabular tiver Tipo Vínculo = Empregado.
-    Extração literal, sem inferência.
+    Regra: cria vínculo APENAS quando a linha do vínculo contém:
+    - sequencial no início
+    - token "Empregado"
+    - data DD/MM/AAAA
+    Extração literal.
     """
 
     resultado = {
@@ -178,97 +236,71 @@ def parse_cnis(texto: str) -> Dict:
     if m:
         resultado["identificacao"]["cpf"] = m.group(1).strip()
 
-    m = RE_NIT.search(texto)
+    m = RE_NIT_ID.search(texto)
     if m:
         resultado["identificacao"]["nit"] = m.group(1).strip()
 
     # --------------------------
-    # PROCESSAMENTO TABULAR
+    # PROCESSAMENTO
     # --------------------------
     linhas = texto.split("\n")
 
     vinculo_atual = None
     bloco_linhas: List[str] = []
 
-    prev_line_nonempty: Optional[str] = None
-    prev_cols_nonempty: List[str] = []
-
     for linha in linhas:
-        ln = linha.rstrip()
-        if not ln.strip():
+        raw = linha.rstrip("\n")
+        ln = raw.strip()
+        if not ln:
             continue
 
-        cols = _split_cols(ln)
-
-        # --- GATILHO: linha tabular com "Empregado" ---
-        if cols and _find_empregado_col(cols):
+        # --------------------------
+        # GATILHO: linha de vínculo "Empregado" válida
+        # --------------------------
+        if _is_likely_vinculo_line(ln):
             # fecha vínculo anterior
             if vinculo_atual:
-                vinculo_atual["ultima_remuneracao"] = _extract_ultima_remun_from_block(bloco_linhas)
-                if _should_append_vinculo(vinculo_atual):
-                    resultado["vinculos"].append(vinculo_atual)
+                # última remuneração pelo bloco acumulado (se não houver, mantém o que já tiver)
+                if not vinculo_atual.get("ultima_remuneracao"):
+                    vinculo_atual["ultima_remuneracao"] = _extract_ultima_remun_from_block(bloco_linhas)
+                resultado["vinculos"].append(vinculo_atual)
 
-            # Campos podem estar visualmente na linha acima (CNIS CIDADÃO)
-            merged_cols = prev_cols_nonempty + cols if prev_cols_nonempty else cols
-
-            data_inicio, data_fim = _extract_datas_from_cols(merged_cols)
-
-            nit_idx = _find_nit_index(merged_cols)
-            nit_vinculo = _safe_get(merged_cols, nit_idx) if nit_idx is not None else None
-
-            # Sequencial (índice do vínculo) costuma estar imediatamente antes do NIT
-            sequencial = None
-            if nit_idx is not None and nit_idx - 1 >= 0:
-                cand = _safe_get(merged_cols, nit_idx - 1)
-                if cand and cand.isdigit():
-                    sequencial = cand
-
-            codigo_emp = None
-            origem_vinculo = None
-
-            # Se achou NIT, tenta capturar por posição (layout tabular)
-            if nit_idx is not None:
-                codigo_emp = _safe_get(merged_cols, nit_idx + 1)
-                origem_vinculo = _safe_get(merged_cols, nit_idx + 2)
-
-            # Se não encontrou ou veio vazio, tenta por regex (literal)
-            if not codigo_emp:
-                codigo_emp = _extract_codigo_emp(merged_cols)
-
-            nome_empresa = _extract_nome_empresa(prev_line_nonempty, prev_cols_nonempty)
-
-            # Correção no momento da detecção: matrícula ocupando posição de Data Fim
-            matricula = None
-            if nit_idx is not None:
-                # Ordem esperada após NIT: codigo_emp, origem, data_inicio, data_fim, ult_remun, tipo...
-                cand_data_fim = _safe_get(merged_cols, nit_idx + 5)
-                if cand_data_fim and (not RE_DATA.search(cand_data_fim)) and _is_numeric_token(cand_data_fim):
-                    if not data_fim:
-                        matricula = cand_data_fim
+            data_inicio, data_fim, idx_ini_data, idx_fim_ult_data = _extract_datas_from_line(ln)
+            sequencial, nit_vinculo, codigo_emp, nome_empresa = _extract_nit_and_codigo_and_empresa(ln, idx_ini_data)
+            matricula, indicadores, ultima_remun_linha = _extract_matricula_and_indicadores(ln, idx_fim_ult_data)
 
             vinculo_atual = {
                 "sequencial": sequencial,
                 "nit_vinculo": nit_vinculo,
                 "nome_empresa": nome_empresa,
                 "codigo_emp": codigo_emp,
-                "origem_vinculo": origem_vinculo,
+                "origem_vinculo": None,
+
                 "tipo_vinculo": "EMPREGADO",
                 "data_inicio": data_inicio,
                 "data_fim": data_fim,
-                "ultima_remuneracao": None,
+
+                # pode vir na linha do vínculo; se não, pode vir do bloco
+                "ultima_remuneracao": ultima_remun_linha,
+
                 "matricula": matricula,
-                "indicadores": _extract_indicadores(cols),
+                "indicadores": indicadores,
                 "remuneracoes": []
             }
 
             bloco_linhas = []
-            prev_line_nonempty = ln
-            prev_cols_nonempty = cols
             continue
 
-        # --- COLETA DE REMUNERAÇÕES (somente se já houver vínculo EMPREGADO) ---
+        # --------------------------
+        # COLETA DE REMUNERAÇÕES (somente se já houver vínculo aberto)
+        # --------------------------
         if vinculo_atual and vinculo_atual.get("tipo_vinculo") == "EMPREGADO":
             bloco_linhas.append(ln)
+
+            # filtro mínimo para reduzir ruído
+            if _is_noise_line_for_remun(ln):
+                continue
+
             mrem = RE_REMUN.search(ln)
             if mrem:
                 competencia = mrem.group(1)
@@ -278,15 +310,11 @@ def parse_cnis(texto: str) -> Dict:
                     "valor": valor
                 })
 
-        # atualiza anterior
-        prev_line_nonempty = ln
-        prev_cols_nonempty = cols
-
     # fecha último vínculo
     if vinculo_atual:
-        vinculo_atual["ultima_remuneracao"] = _extract_ultima_remun_from_block(bloco_linhas)
-        if _should_append_vinculo(vinculo_atual):
-            resultado["vinculos"].append(vinculo_atual)
+        if not vinculo_atual.get("ultima_remuneracao"):
+            vinculo_atual["ultima_remuneracao"] = _extract_ultima_remun_from_block(bloco_linhas)
+        resultado["vinculos"].append(vinculo_atual)
 
     return resultado
 
